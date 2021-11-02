@@ -1,0 +1,3 @@
+[submodule "3rd/cnpy"]
+	path = src/3rd/cnpy
+	url = https://github.com/rogersce/cnpy.git
