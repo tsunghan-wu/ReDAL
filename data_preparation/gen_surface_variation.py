@@ -76,7 +76,6 @@ elif args.name == "semantic_kitti":
 
         for fname in os.listdir(coords_dir):
             coords_path = os.path.join(coords_dir, fname)
-            rgb_path = coords_path.replace('velodyne', 'rgb')
             xyz = np.fromfile(coords_path, dtype=np.float32).reshape(-1, 4)[:, :3]
             rgb = np.zeros_like(xyz)
             edge_npy = boundary_extractor(xyz, rgb, threshold=0.1)
