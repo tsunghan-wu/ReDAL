@@ -36,17 +36,20 @@ class ReDALSelector:
         do_not_convert = ['file_name', 'curvature', 'colorgrad']
         with torch.no_grad():
             for i_iter_test, batch in enumerate(tqdm_loader):
-                # predict
+                # Move tensors from CPU memory to GPU memory by .cuda() method
                 for key, value in batch.items():
                     if key not in do_not_convert:
                         batch[key] = value.cuda()
 
+                # Network forwarding.
                 inputs = batch['lidar']
                 outputs = model(inputs)
-                preds = outputs['final']
-                invs = batch['inverse_map']
-                all_labels = batch['targets_mapped']
+                preds = outputs['final']  # predicted segmentation result
 
+                # Some postprocessing steps. Here we just follow the prior work: SPVCNN.
+                # Ref: https://github.com/mit-han-lab/spvnas/blob/master/core/trainers.py#L69
+                invs = batch['inverse_map']
+                supvox_IDs = batch['targets_mapped']
                 feats = outputs['pt_feat']
                 featC = feats.C.cpu().numpy()
                 supvox = batch['targets'].F.long()
@@ -55,39 +58,53 @@ class ReDALSelector:
                 invsC = invs.C.cpu().numpy()
                 invsF = invs.F.cpu().numpy()
 
-                all_labels_F = all_labels.F.cpu().numpy()
-                all_labels_C = all_labels.C.cpu().numpy()
+                supvox_IDs_F = supvox_IDs.F.cpu().numpy()
+                supvox_IDs_C = supvox_IDs.C.cpu().numpy()
 
+                # Process each point cloud in a batch
                 for batch_idx in range(self.batch_size):
                     fname = batch['file_name'][batch_idx]
+                    # The color discontinuity and structural complexity terms are preprocessed.
                     colorgrad = batch['colorgrad'][batch_idx]
                     curvature = batch['curvature'][batch_idx]
                     assert fname == pool_set.im_idx[idx]
+                    # Obtain the "key" of all valid (unlabeled) regions.
+                    point_cloud_key = pool_set.im_idx[idx]
+                    valid_region_key = np.array(pool_set.supvox[point_cloud_key])
 
+                    # Get the inverted index of a point cloud.
                     cur_scene_pts = (scene_pts[:, -1] == batch_idx)
                     cur_inv = invsF[invsC[:, -1] == batch_idx]
+
+                    # [Uncertainty Calculation]
+                    # 1. Take out the segmentation prediction of all points beloning to a single point cloud.
+                    # 2. Then, perform uncertainty calculation.
                     output = preds[cur_scene_pts][cur_inv]
                     output = torch.nn.functional.softmax(output, dim=1)
                     uncertain = torch.mean(-output * torch.log2(output + 1e-12), dim=1)
                     uncertain = uncertain.cpu().detach().numpy()
-                    cur_label = (all_labels_C[:, -1] == batch_idx)
-                    cur_supvox = all_labels_F[cur_label]
 
-                    # region feature
+                    # [Region Feature Extraction]
+                    # 1. Take out the supervoxel ID of all points belonging to a single point cloud.
+                    # 2. Gathering region features using torch_scatter library, which is convenient
+                    #    for us to gather all point features belonging to the same supervoxel ID.
+                    # 3. Finally, we combine them into a numpy array (named as all_feats) for subsequent usage.
+                    cur_supvox = supvox_IDs_F[supvox_IDs_C[:, -1] == batch_idx]
                     feat = feats.F[featC[:, -1] == batch_idx]
                     supvox_id = supvox[featC[:, -1] == batch_idx]
                     feat = scatter_mean(feat, supvox_id, dim=0).cpu().numpy()
-
-                    key = pool_set.im_idx[idx]
-                    selected_row = np.array(pool_set.supvox[key])
-                    feat = feat[selected_row]
+                    feat = feat[valid_region_key]
                     all_feats = np.concatenate([all_feats, feat], axis=0)
-                    # Groupby
-                    val = self.config.alpha * uncertain + self.config.beta * colorgrad + self.config.gamma * curvature
-                    df = pd.DataFrame({'id': cur_supvox, 'val': val})
+
+                    # Per-point information score. (Refer to the equation 4 in the main paper.)
+                    point_score = self.config.alpha * uncertain + self.config.beta * colorgrad \
+                        + self.config.gamma * curvature
+                    # We gather the region information scores using "pandas groupby method" as shown below.
+                    # This is efficient to gather per-point scores belonging to the same supervoxel ID into one.
+                    df = pd.DataFrame({'id': cur_supvox, 'val': point_score})
                     df1 = df.groupby('id')['val'].agg(['count', 'mean']).reset_index()
-                    table = df1[df1['id'].isin(pool_set.supvox[key])].drop(columns=['count'])
-                    table['key'] = key
+                    table = df1[df1['id'].isin(pool_set.supvox[point_cloud_key])].drop(columns=['count'])
+                    table['key'] = point_cloud_key
                     table = table.reindex(columns=['mean', 'key', 'id'])
                     region_score = list(table.itertuples(index=False, name=None))
                     scores.extend(region_score)
@@ -97,7 +114,7 @@ class ReDALSelector:
                         break
                 if idx >= len(pool_set.im_idx):
                     break
-        # save region entropy & feature
+        # Save region information score & region feature for subsequent usage.
         fname = os.path.join(trainer.model_save_dir, "AL_record", f"region_val_{trainer.local_rank}.json")
         with open(fname, "w") as f:
             json.dump(scores, f)
@@ -115,7 +132,8 @@ class ReDALSelector:
             feat_fname = os.path.join(trainer.model_save_dir, "AL_record", "region_feat_0.npy")
             features = np.load(feat_fname)
 
-            # selected_samples = importance_reweight(scores, features)
+            # [Diversity-aware Selection]
+            # The "importance_reweight" function is the implementation of Sec.3.3.2 in the main paper.
             selected_samples = importance_reweight(scores, features, self.config)
             active_set.expand_training_set(selected_samples, selection_percent)
         else:
@@ -134,5 +152,7 @@ class ReDALSelector:
                     feat_lst.append(np.load(npy_fname))
                 features = np.concatenate(feat_lst, 0)
 
+                # [Diversity-aware Selection]
+                # The "importance_reweight" function is the implementation of Sec.3.3.2 in the main paper.
                 selected_samples = importance_reweight(scores, features, self.config)
                 active_set.expand_training_set(selected_samples, selection_percent)

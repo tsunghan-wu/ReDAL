@@ -2,6 +2,7 @@
 from sklearn.cluster import KMeans
 
 
+# The core implementation of our diversity-aware selection algorithm.
 def importance_reweight(scores, features, config):
     # sorted (first time)
     sorted_idx = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)
